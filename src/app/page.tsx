@@ -3,8 +3,8 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 
 // --- CONFIGURATION ---
-const TEST_DURATION_SECONDS = 60;
-const PLACEHOLDER_VIDEO_URL = 'https://storage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4';
+const DEFAULT_TEST_DURATION_SECONDS = 60;
+const PLACEHOLDER_VIDEO_URL = 'https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8';
 const INVALID_VIDEO_URL = 'http://force.error.test/invalid-video-source.mp4';
 
 type ChaosType = 'none' | '404' | 'spikey';
@@ -54,6 +54,8 @@ interface Simulation {
   totalBytes: number;
   bitrateHistory: BitrateInfo[];
   errorCodes: number[];
+  testDuration: number;
+  cacheBuster: string;
 }
 
 // --- UTILITY FUNCTIONS & STYLED COMPONENTS ---
@@ -111,12 +113,13 @@ const KpiDisplay = ({ value, label, unit = '', colorClass = 'text-cyan-400' }: {
 // --- SHAKA PLAYER COMPONENT ---
 const ShakaPlayer = React.forwardRef<HTMLVideoElement, {
   videoUrl: string;
+  status: Simulation['status'];
   onMetricsUpdate: (metrics: { totalBytes: number; currentBitrate: number }) => void;
   onError: (code: number, message: string) => void;
   onPlaying: () => void;
   onWaiting: () => void;
   onCanPlay: () => void;
-}>(({ videoUrl, onMetricsUpdate, onError, onPlaying, onWaiting, onCanPlay }, ref) => {
+}>(({ videoUrl, status, onMetricsUpdate, onError, onPlaying, onWaiting, onCanPlay }, ref) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const playerRef = useRef<any>(null);
   const metricsIntervalRef = useRef<NodeJS.Timeout | null>(null);
@@ -259,7 +262,7 @@ const ShakaPlayer = React.forwardRef<HTMLVideoElement, {
     <div ref={containerRef} className="w-full h-full">
       <video
         ref={ref as React.RefObject<HTMLVideoElement>}
-        controls
+        controls={status !== 'pending' && status !== 'running'}
         muted
         poster="https://placehold.co/1280x720/0f172a/67e8f9?text=SYSTEM+VIDEO+FEED"
         className="w-full h-full object-cover"
@@ -283,8 +286,14 @@ const SimulationCard = React.memo(({ simulation, onUpdate, onRemove }: { simulat
   const lastBitrateRef = useRef<number>(0);
   const bitrateStartTimeRef = useRef<number>(0);
 
-  const { id, name, preset, status, isMinimized, errorCount, rebufferingCount, rebufferingTime, ttff, playbackPercent, startTime, videoUrl, totalBytes, bitrateHistory, errorCodes } = simulation;
+  const { id, name, preset, status, isMinimized, errorCount, rebufferingCount, rebufferingTime, ttff, playbackPercent, startTime, videoUrl, totalBytes, bitrateHistory, errorCodes, testDuration, cacheBuster } = simulation;
   const config = PRESETS[preset];
+
+  // Add cache-busting parameter to video URL
+  const videoUrlWithCache = useMemo(() => {
+    const separator = videoUrl.includes('?') ? '&' : '?';
+    return `${videoUrl}${separator}_cb=${cacheBuster}`;
+  }, [videoUrl, cacheBuster]);
 
   const updateStatus = useCallback((newStatus: Simulation['status']) => {
     onUpdate(id, { status: newStatus });
@@ -324,7 +333,7 @@ const SimulationCard = React.memo(({ simulation, onUpdate, onRemove }: { simulat
     if (!video || status !== 'running') return;
 
     const currentTestTime = performance.now() - (startTime || 0);
-    const percent = Math.min(100, (currentTestTime / (TEST_DURATION_SECONDS * 1000)) * 100);
+    const percent = Math.min(100, (currentTestTime / (testDuration * 1000)) * 100);
 
     onUpdate(id, { playbackPercent: parseFloat(percent.toFixed(1)) });
   }, [id, status, startTime, onUpdate]);
@@ -424,7 +433,7 @@ const SimulationCard = React.memo(({ simulation, onUpdate, onRemove }: { simulat
             playbackPercent: 100,
           });
         }
-      }, TEST_DURATION_SECONDS * 1000 + config.delay);
+      }, testDuration * 1000 + config.delay);
 
       if (config.chaosType === '404' || config.chaosType === 'spikey') {
         chaosIntervalRef.current = setInterval(injectChaos, 3000);
@@ -454,12 +463,39 @@ const SimulationCard = React.memo(({ simulation, onUpdate, onRemove }: { simulat
   const isFinished = status === 'completed' || status === 'failed';
   const progressColor = errorCount > 0 ? 'bg-red-500 shadow-red-500/50' : 'bg-cyan-500 shadow-cyan-500/50';
 
+  const handleRerun = useCallback((e: React.MouseEvent) => {
+    e.stopPropagation();
+    onUpdate(id, {
+      status: 'pending',
+      ttff: null,
+      rebufferingCount: 0,
+      rebufferingTime: 0,
+      errorCount: 0,
+      playbackPercent: 0,
+      startTime: null,
+      endTime: null,
+      totalBytes: 0,
+      bitrateHistory: [],
+      errorCodes: [],
+      cacheBuster: Date.now().toString()
+    });
+  }, [id, onUpdate]);
+
   const renderMinimized = () => (
     <div
       className="flex items-center justify-between p-3 bg-gray-900 border-b border-cyan-800/50 hover:bg-gray-800 transition duration-150 cursor-pointer text-white font-mono"
       onClick={() => onUpdate(id, { isMinimized: false })}
     >
       <div className="flex items-center space-x-3 w-5/12">
+        {isFinished && (
+          <button
+            onClick={handleRerun}
+            className="p-1.5 text-green-400 hover:text-white hover:bg-green-800/30 rounded-full transition border border-green-700/50 shadow-md shadow-green-900/50"
+            title="RERUN TEST"
+          >
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+          </button>
+        )}
         <StatusIcon status={status} />
         <span className={`px-2 py-0.5 text-xs font-bold rounded-sm uppercase tracking-widest ${statusClasses}`}>
           {status}
@@ -467,7 +503,7 @@ const SimulationCard = React.memo(({ simulation, onUpdate, onRemove }: { simulat
         <div className="flex flex-col">
           <span className="font-semibold text-gray-200 truncate text-sm">{name}</span>
           <span className="text-xs text-gray-500">
-            Delay: {config.delay}ms | Error Rate: {(config.errorRate * 100).toFixed(0)}%
+            Duration: {testDuration}s | Delay: {config.delay}ms | Error Rate: {(config.errorRate * 100).toFixed(0)}%
             {errorCodes.length > 0 && ` | Codes: ${errorCodes.join(', ')}`}
           </span>
         </div>
@@ -509,7 +545,7 @@ const SimulationCard = React.memo(({ simulation, onUpdate, onRemove }: { simulat
               {status}
             </span>
             <span className="text-sm text-gray-500 font-medium">
-              RUNTIME: {isFinished ? `00:${TEST_DURATION_SECONDS}` : formatDuration(TEST_DURATION_SECONDS * 1000)}
+              RUNTIME: {isFinished ? formatDuration(testDuration * 1000) : formatDuration(testDuration * 1000)}
             </span>
           </div>
         </div>
@@ -583,7 +619,8 @@ const SimulationCard = React.memo(({ simulation, onUpdate, onRemove }: { simulat
       <div className="relative mb-6 rounded-lg overflow-hidden shadow-2xl shadow-black/50 border-2 border-cyan-900/50 aspect-video">
         <ShakaPlayer
           ref={videoRef}
-          videoUrl={videoUrl}
+          videoUrl={videoUrlWithCache}
+          status={status}
           onMetricsUpdate={handleMetricsUpdate}
           onError={logError}
           onPlaying={handleInitialPlay}
@@ -626,6 +663,7 @@ const SimulationCreator = ({ videoUrl, onCreate, setVideoUrl, clientInfo }: { vi
   const [isOpen, setIsOpen] = useState(false);
   const [selectedPreset, setSelectedPreset] = useState('baseline');
   const [customName, setCustomName] = useState('');
+  const [testDuration, setTestDuration] = useState(DEFAULT_TEST_DURATION_SECONDS);
 
   const handleCreate = (e: React.FormEvent) => {
     e.preventDefault();
@@ -646,7 +684,9 @@ const SimulationCreator = ({ videoUrl, onCreate, setVideoUrl, clientInfo }: { vi
       endTime: null,
       totalBytes: 0,
       bitrateHistory: [],
-      errorCodes: []
+      errorCodes: [],
+      testDuration: testDuration,
+      cacheBuster: Date.now().toString()
     };
     onCreate(newSim);
     setIsOpen(false);
@@ -702,6 +742,18 @@ const SimulationCreator = ({ videoUrl, onCreate, setVideoUrl, clientInfo }: { vi
               className="mt-1 block w-full bg-gray-800 border border-cyan-700/50 text-cyan-400 rounded-md shadow-inner p-3"
               placeholder={PRESETS[selectedPreset].name + ' TEST'}
             />
+          </div>
+          <div className="mb-4">
+            <label className="block text-sm font-medium text-gray-400 mb-1">Test Duration (seconds)</label>
+            <input
+              type="number"
+              value={testDuration}
+              onChange={(e) => setTestDuration(parseInt(e.target.value) || DEFAULT_TEST_DURATION_SECONDS)}
+              min="10"
+              max="600"
+              className="mt-1 block w-full bg-gray-800 border border-cyan-700/50 text-cyan-400 rounded-md shadow-inner p-3"
+            />
+            <p className="text-xs text-gray-600 mt-1">Duration of the test in seconds (10-600).</p>
           </div>
           <div className="mb-6">
             <label className="block text-sm font-medium text-gray-400 mb-1">Select Chaos Protocol</label>
@@ -779,7 +831,9 @@ export default function App() {
         endTime: null,
         totalBytes: 0,
         bitrateHistory: [],
-        errorCodes: []
+        errorCodes: [],
+        testDuration: DEFAULT_TEST_DURATION_SECONDS,
+        cacheBuster: Date.now().toString()
       }]);
     }
   }, [simulations.length]);
@@ -811,7 +865,7 @@ export default function App() {
         <h1 className="text-4xl font-extrabold text-cyan-400 mb-2 uppercase tracking-widest drop-shadow-lg shadow-cyan-400">
           <span className="text-gray-500 mr-2">[//]</span> OPERATION: MEDIA STABILITY
         </h1>
-        <p className="text-gray-500 text-sm">ENGAGED: Real-time network chaos simulation. Test duration: {TEST_DURATION_SECONDS} seconds.</p>
+        <p className="text-gray-500 text-sm">ENGAGED: Real-time network chaos simulation with adaptive bitrate testing.</p>
         {clientInfo && (
           <p className="mt-2 text-xs text-gray-600">
             CLIENT: {clientInfo.ip} | {clientInfo.city}, {clientInfo.country} | {clientInfo.org}
