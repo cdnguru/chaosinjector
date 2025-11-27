@@ -129,6 +129,48 @@ const ShakaPlayer = React.forwardRef<HTMLVideoElement, {
     const videoElement = ref as React.RefObject<HTMLVideoElement>;
     if (!videoElement.current || !containerRef.current) return;
 
+    // Detect if URL is HLS or DASH
+    const isHLS = videoUrl.includes('.m3u8');
+    const isDASH = videoUrl.includes('.mpd');
+    const isStreaming = isHLS || isDASH;
+
+    if (!isStreaming) {
+      // Use native video element for MP4
+      if (videoElement.current) {
+        videoElement.current.src = videoUrl;
+        videoElement.current.load();
+      }
+
+      // Simple metrics for native playback
+      metricsIntervalRef.current = setInterval(() => {
+        if (videoElement.current) {
+          // Estimate bytes from buffered ranges
+          const buffered = videoElement.current.buffered;
+          if (buffered.length > 0) {
+            const duration = videoElement.current.duration;
+            const bufferedEnd = buffered.end(buffered.length - 1);
+            const percentBuffered = duration > 0 ? bufferedEnd / duration : 0;
+
+            // Rough estimate: assume 5 Mbps for HD video
+            const estimatedTotalBytes = duration * 5 * 1000000 / 8;
+            const downloadedBytes = estimatedTotalBytes * percentBuffered;
+
+            onMetricsUpdate({
+              totalBytes: Math.round(downloadedBytes),
+              currentBitrate: 5000000 // 5 Mbps estimate
+            });
+          }
+        }
+      }, 1000);
+
+      return () => {
+        if (metricsIntervalRef.current) {
+          clearInterval(metricsIntervalRef.current);
+        }
+      };
+    }
+
+    // Use Shaka Player for HLS/DASH
     let shaka: any;
 
     const initPlayer = async () => {
