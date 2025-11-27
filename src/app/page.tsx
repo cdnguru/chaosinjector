@@ -139,6 +139,17 @@ const ShakaPlayer = React.forwardRef<HTMLVideoElement, {
       if (videoElement.current) {
         videoElement.current.src = videoUrl;
         videoElement.current.load();
+
+        // Autoplay after video can play
+        const handleCanPlayThrough = () => {
+          if (videoElement.current) {
+            videoElement.current.play().catch(e =>
+              console.log('Autoplay failed, user interaction needed.', e)
+            );
+          }
+        };
+
+        videoElement.current.addEventListener('canplaythrough', handleCanPlayThrough, { once: true });
       }
 
       // Simple metrics for native playback
@@ -198,8 +209,15 @@ const ShakaPlayer = React.forwardRef<HTMLVideoElement, {
           onError(error.code, error.message || 'Shaka Player Error');
         });
 
-        // Load the manifest
-        player.load(videoUrl).catch((error: any) => {
+        // Load the manifest and autoplay
+        player.load(videoUrl).then(() => {
+          // Autoplay after manifest is loaded
+          if (videoElement.current) {
+            videoElement.current.play().catch((e: any) =>
+              console.log('Autoplay failed, user interaction needed.', e)
+            );
+          }
+        }).catch((error: any) => {
           onError(error.code || 999, error.message || 'Failed to load video');
         });
 
@@ -368,12 +386,7 @@ const SimulationCard = React.memo(({ simulation, onUpdate, onRemove }: { simulat
       if (startTime === null) {
         onUpdate(id, { startTime: performance.now() });
         ttffStartRef.current = performance.now();
-
-        setTimeout(() => {
-          if (video) {
-            video.play().catch(e => console.log(`[${name}] Autoplay failed, user interaction needed.`, e));
-          }
-        }, config.delay);
+        // Player component will handle playback after loading
       }
     }
 
