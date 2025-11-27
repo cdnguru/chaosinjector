@@ -24,6 +24,19 @@ const PRESETS: Record<string, PresetConfig> = {
   spikey: { name: "SPIKE CHAOS", description: "Randomly injects packet drops and buffering events. High variability.", delay: 0, errorRate: 0.05, chaosType: 'spikey' }
 };
 
+interface BitrateInfo {
+  bitrate: number;
+  timeSpent: number;
+}
+
+interface ClientInfo {
+  ip: string;
+  city: string;
+  region: string;
+  country: string;
+  org: string;
+}
+
 interface Simulation {
   id: string;
   name: string;
@@ -38,6 +51,9 @@ interface Simulation {
   playbackPercent: number;
   startTime: number | null;
   endTime: number | null;
+  totalBytes: number;
+  bitrateHistory: BitrateInfo[];
+  errorCodes: number[];
 }
 
 // --- UTILITY FUNCTIONS & STYLED COMPONENTS ---
@@ -51,6 +67,20 @@ const formatDuration = (ms: number | null | undefined) => {
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;
   return `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+};
+
+/** Formats bytes to human readable */
+const formatBytes = (bytes: number) => {
+  if (bytes === 0) return '0 B';
+  const k = 1024;
+  const sizes = ['B', 'KB', 'MB', 'GB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return `${(bytes / Math.pow(k, i)).toFixed(2)} ${sizes[i]}`;
+};
+
+/** Formats bitrate to Mbps */
+const formatBitrate = (bps: number) => {
+  return `${(bps / 1000000).toFixed(2)} Mbps`;
 };
 
 // SVG Icons for Status
@@ -75,20 +105,123 @@ const KpiDisplay = ({ value, label, unit = '', colorClass = 'text-cyan-400' }: {
   </div>
 );
 
-// --- SIMULATION CARD COMPONENT ---
+// --- SHAKA PLAYER COMPONENT ---
+const ShakaPlayer = React.forwardRef<HTMLVideoElement, {
+  videoUrl: string;
+  onMetricsUpdate: (metrics: { totalBytes: number; currentBitrate: number }) => void;
+  onError: (code: number, message: string) => void;
+  onPlaying: () => void;
+  onWaiting: () => void;
+  onCanPlay: () => void;
+}>(({ videoUrl, onMetricsUpdate, onError, onPlaying, onWaiting, onCanPlay }, ref) => {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const playerRef = useRef<any>(null);
+  const metricsIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const [isClient, setIsClient] = useState(false);
 
+  useEffect(() => {
+    setIsClient(true);
+  }, []);
+
+  useEffect(() => {
+    if (!isClient) return;
+
+    const videoElement = ref as React.RefObject<HTMLVideoElement>;
+    if (!videoElement.current || !containerRef.current) return;
+
+    let shaka: any;
+
+    const initPlayer = async () => {
+      try {
+        // Dynamic import for client-side only
+        shaka = (await import('shaka-player/dist/shaka-player.ui.js')).default;
+
+        // Install polyfills
+        shaka.polyfill.installAll();
+
+        // Check browser support
+        if (!shaka.Player.isBrowserSupported()) {
+          console.error('Browser not supported!');
+          return;
+        }
+
+        const player = new shaka.Player();
+        playerRef.current = player;
+
+        player.attach(videoElement.current);
+
+        // Error handling
+        player.addEventListener('error', (event: any) => {
+          const error = event.detail;
+          onError(error.code, error.message || 'Shaka Player Error');
+        });
+
+        // Load the manifest
+        player.load(videoUrl).catch((error: any) => {
+          onError(error.code || 999, error.message || 'Failed to load video');
+        });
+
+        // Metrics tracking
+        metricsIntervalRef.current = setInterval(() => {
+          if (player) {
+            const stats = player.getStats();
+            const currentBitrate = stats.estimatedBandwidth || 0;
+            const totalBytes = stats.streamBandwidth ? (stats.streamBandwidth * stats.playTime) / 8 : 0;
+
+            onMetricsUpdate({
+              totalBytes: Math.round(totalBytes),
+              currentBitrate: Math.round(currentBitrate)
+            });
+          }
+        }, 1000);
+      } catch (error) {
+        console.error('Failed to load Shaka Player:', error);
+        onError(999, 'Failed to initialize player');
+      }
+    };
+
+    initPlayer();
+
+    return () => {
+      if (metricsIntervalRef.current) {
+        clearInterval(metricsIntervalRef.current);
+      }
+      if (playerRef.current) {
+        playerRef.current.destroy();
+      }
+    };
+  }, [videoUrl, onError, onMetricsUpdate, ref, isClient]);
+
+  return (
+    <div ref={containerRef} className="w-full h-full">
+      <video
+        ref={ref as React.RefObject<HTMLVideoElement>}
+        controls
+        muted
+        poster="https://placehold.co/1280x720/0f172a/67e8f9?text=SYSTEM+VIDEO+FEED"
+        className="w-full h-full object-cover"
+        onPlaying={onPlaying}
+        onWaiting={onWaiting}
+        onCanPlay={onCanPlay}
+      />
+    </div>
+  );
+});
+
+ShakaPlayer.displayName = 'ShakaPlayer';
+
+// --- SIMULATION CARD COMPONENT ---
 const SimulationCard = React.memo(({ simulation, onUpdate, onRemove }: { simulation: Simulation, onUpdate: (id: string, updates: Partial<Simulation> | ((prev: Simulation) => Partial<Simulation>)) => void, onRemove: (id: string) => void }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const rebufferingTimerRef = useRef(0);
   const ttffStartRef = useRef(0);
   const intervalRef = useRef<NodeJS.Timeout | null>(null);
   const chaosIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const lastBitrateRef = useRef<number>(0);
+  const bitrateStartTimeRef = useRef<number>(0);
 
-  // Destructure videoUrl and startTime from simulation state
-  const { id, name, preset, status, isMinimized, errorCount, rebufferingCount, rebufferingTime, ttff, playbackPercent, startTime, videoUrl } = simulation;
+  const { id, name, preset, status, isMinimized, errorCount, rebufferingCount, rebufferingTime, ttff, playbackPercent, startTime, videoUrl, totalBytes, bitrateHistory, errorCodes } = simulation;
   const config = PRESETS[preset];
-
-  // --- KPI AND STATE UPDATERS (Logic remains unchanged) ---
 
   const updateStatus = useCallback((newStatus: Simulation['status']) => {
     onUpdate(id, { status: newStatus });
@@ -99,6 +232,7 @@ const SimulationCard = React.memo(({ simulation, onUpdate, onRemove }: { simulat
       const newStatus = (sim.status === 'running' || sim.status === 'pending') ? 'failed' : sim.status;
       return {
         errorCount: sim.errorCount + 1,
+        errorCodes: [...sim.errorCodes, code],
         status: newStatus,
       };
     });
@@ -116,7 +250,7 @@ const SimulationCard = React.memo(({ simulation, onUpdate, onRemove }: { simulat
     if (rebufferingTimerRef.current > 0) {
       const timeElapsed = performance.now() - rebufferingTimerRef.current;
       onUpdate(id, (sim: Simulation) => ({
-        rebufferingTime: sim.rebufferingTime + (timeElapsed / 1000), // Convert to seconds
+        rebufferingTime: sim.rebufferingTime + (timeElapsed / 1000),
       }));
       rebufferingTimerRef.current = 0;
     }
@@ -138,9 +272,32 @@ const SimulationCard = React.memo(({ simulation, onUpdate, onRemove }: { simulat
       onUpdate(id, { ttff: parseFloat(timeToFirstFrame.toFixed(2)) });
       ttffStartRef.current = 0;
       updateStatus('running');
+      bitrateStartTimeRef.current = performance.now();
     }
     handleRebufferingEnd();
   }, [id, onUpdate, updateStatus, handleRebufferingEnd]);
+
+  const handleMetricsUpdate = useCallback((metrics: { totalBytes: number; currentBitrate: number }) => {
+    onUpdate(id, (sim: Simulation) => {
+      const newHistory = [...sim.bitrateHistory];
+
+      if (metrics.currentBitrate !== lastBitrateRef.current && lastBitrateRef.current > 0) {
+        const timeSpent = (performance.now() - bitrateStartTimeRef.current) / 1000;
+        newHistory.push({
+          bitrate: lastBitrateRef.current,
+          timeSpent: timeSpent
+        });
+        bitrateStartTimeRef.current = performance.now();
+      }
+
+      lastBitrateRef.current = metrics.currentBitrate;
+
+      return {
+        totalBytes: metrics.totalBytes,
+        bitrateHistory: newHistory
+      };
+    });
+  }, [id, onUpdate]);
 
   const injectChaos = useCallback(() => {
     if (Math.random() < config.errorRate) {
@@ -161,7 +318,6 @@ const SimulationCard = React.memo(({ simulation, onUpdate, onRemove }: { simulat
     }
   }, [config.errorRate, name, videoUrl]);
 
-  // --- MAIN TEST LIFECYCLE EFFECT (Logic remains unchanged) ---
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
@@ -172,23 +328,12 @@ const SimulationCard = React.memo(({ simulation, onUpdate, onRemove }: { simulat
         ttffStartRef.current = performance.now();
 
         setTimeout(() => {
-          video.src = videoUrl;
-          video.load();
-          video.play().catch(e => console.log(`[${name}] Autoplay failed, user interaction needed.`, e));
+          if (video) {
+            video.play().catch(e => console.log(`[${name}] Autoplay failed, user interaction needed.`, e));
+          }
         }, config.delay);
       }
     }
-
-    video.onerror = (_e) => {
-      const errorObj = video.error;
-      const code = errorObj ? errorObj.code : 99;
-      const message = errorObj ? (errorObj.message || 'Media playback failed.') : 'Unknown error.';
-      logError(code, message);
-    };
-    video.addEventListener('playing', handleInitialPlay);
-    video.addEventListener('waiting', handleRebufferingStart);
-    video.addEventListener('stalled', handleRebufferingStart);
-    video.addEventListener('canplay', handleRebufferingEnd);
 
     if (status === 'running') {
       intervalRef.current = setInterval(handlePlaybackUpdate, 250);
@@ -198,13 +343,29 @@ const SimulationCard = React.memo(({ simulation, onUpdate, onRemove }: { simulat
         if (chaosIntervalRef.current) {
           clearInterval(chaosIntervalRef.current);
         }
-        video.pause();
-        video.src = '';
-        onUpdate(id, (sim: Simulation) => ({
-          status: 'completed',
-          endTime: performance.now(),
-          playbackPercent: 100,
-        }));
+        if (video) {
+          video.pause();
+        }
+
+        // Save final bitrate
+        if (lastBitrateRef.current > 0) {
+          const timeSpent = (performance.now() - bitrateStartTimeRef.current) / 1000;
+          onUpdate(id, (sim: Simulation) => ({
+            status: 'completed',
+            endTime: performance.now(),
+            playbackPercent: 100,
+            bitrateHistory: [...sim.bitrateHistory, {
+              bitrate: lastBitrateRef.current,
+              timeSpent: timeSpent
+            }]
+          }));
+        } else {
+          onUpdate(id, {
+            status: 'completed',
+            endTime: performance.now(),
+            playbackPercent: 100,
+          });
+        }
       }, TEST_DURATION_SECONDS * 1000 + config.delay);
 
       if (config.chaosType === '404' || config.chaosType === 'spikey') {
@@ -219,16 +380,9 @@ const SimulationCard = React.memo(({ simulation, onUpdate, onRemove }: { simulat
     return () => {
       if (intervalRef.current) clearInterval(intervalRef.current);
       if (chaosIntervalRef.current) clearInterval(chaosIntervalRef.current);
-      video.removeEventListener('playing', handleInitialPlay);
-      video.removeEventListener('waiting', handleRebufferingStart);
-      video.removeEventListener('stalled', handleRebufferingStart);
-      video.removeEventListener('canplay', handleRebufferingEnd);
     };
 
-  }, [status, config, logError, handleInitialPlay, handleRebufferingStart, handleRebufferingEnd, handlePlaybackUpdate, injectChaos, onUpdate, id, name, videoUrl, startTime]);
-
-
-  // --- RENDER LOGIC (Aesthetic Overhaul) ---
+  }, [status, config, handlePlaybackUpdate, injectChaos, onUpdate, id, name, startTime]);
 
   const statusClasses = useMemo(() => {
     switch (status) {
@@ -247,39 +401,40 @@ const SimulationCard = React.memo(({ simulation, onUpdate, onRemove }: { simulat
       className="flex items-center justify-between p-3 bg-gray-900 border-b border-cyan-800/50 hover:bg-gray-800 transition duration-150 cursor-pointer text-white font-mono"
       onClick={() => onUpdate(id, { isMinimized: false })}
     >
-      <div className="flex items-center space-x-4 w-4/12 sm:w-3/12">
+      <div className="flex items-center space-x-3 w-5/12">
         <StatusIcon status={status} />
         <span className={`px-2 py-0.5 text-xs font-bold rounded-sm uppercase tracking-widest ${statusClasses}`}>
           {status}
         </span>
-        <span className="font-semibold text-gray-200 truncate">{name}</span>
+        <div className="flex flex-col">
+          <span className="font-semibold text-gray-200 truncate text-sm">{name}</span>
+          <span className="text-xs text-gray-500">
+            Delay: {config.delay}ms | Error Rate: {(config.errorRate * 100).toFixed(0)}%
+            {errorCodes.length > 0 && ` | Codes: ${errorCodes.join(', ')}`}
+          </span>
+        </div>
       </div>
 
-      <div className="flex flex-1 justify-between text-center text-sm ml-4 uppercase">
-        {/* TTFF */}
+      <div className="flex flex-1 justify-between text-center text-xs ml-4">
         <div className="flex-1 min-w-0">
           <span className="font-bold text-cyan-400">{ttff !== null ? `${ttff.toFixed(0)}` : '---'}</span>
           <span className="text-xs text-gray-500 block">TTFF</span>
         </div>
-        {/* Rebuffers */}
         <div className="flex-1 min-w-0">
           <span className="font-bold text-cyan-400">{rebufferingCount}</span>
           <span className="text-xs text-gray-500 block">Rebuffers</span>
         </div>
-        {/* Rebuffer Time */}
         <div className="flex-1 min-w-0">
-          <span className="font-bold text-cyan-400">{rebufferingTime.toFixed(2)}</span>
-          <span className="text-xs text-gray-500 block">Rebuffer Sec</span>
+          <span className="font-bold text-cyan-400">{formatBytes(totalBytes)}</span>
+          <span className="text-xs text-gray-500 block">Downloaded</span>
         </div>
-        {/* Errors */}
         <div className="flex-1 min-w-0">
           <span className={`font-bold ${errorCount > 0 ? 'text-red-500' : 'text-cyan-400'}`}>{errorCount}</span>
           <span className="text-xs text-gray-500 block">Faults</span>
         </div>
-      </div>
-
-      <div className="w-1/12 text-right">
-        <span className={`font-bold text-lg ${errorCount > 0 ? 'text-red-500' : 'text-green-400'} tracking-widest`}>{playbackPercent.toFixed(1)}%</span>
+        <div className="flex-1 min-w-0">
+          <span className={`font-bold text-lg ${errorCount > 0 ? 'text-red-500' : 'text-green-400'}`}>{playbackPercent.toFixed(1)}%</span>
+        </div>
       </div>
     </div>
   );
@@ -306,56 +461,76 @@ const SimulationCard = React.memo(({ simulation, onUpdate, onRemove }: { simulat
             className="p-2 text-cyan-400 hover:text-white hover:bg-cyan-800/30 rounded-full transition border border-cyan-700/50 shadow-md shadow-cyan-900/50"
             title="MINIMIZE SYSTEM"
           >
-            <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M20 12H4"></path></svg>
+            <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M20 12H4"></path></svg>
           </button>
           <button
             onClick={() => onRemove(id)}
             className="p-2 text-red-500 hover:text-white hover:bg-red-800/30 rounded-full transition border border-red-700/50 shadow-md shadow-red-900/50"
             title="PURGE DATA"
           >
-            <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/24 24/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+            <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
           </button>
         </div>
       </div>
 
-      <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mb-6">
+      <div className="grid grid-cols-2 md:grid-cols-6 gap-4 mb-6">
         <KpiDisplay
           value={ttff !== null ? `${ttff.toFixed(0)}` : 'INIT'}
           unit="ms"
-          label="TIME TO FIRST FRAME"
+          label="TTFF"
         />
         <KpiDisplay
           value={rebufferingCount}
-          label="REBUFFER EVENTS"
+          label="REBUFFERS"
           colorClass={rebufferingCount > 0 ? 'text-yellow-400' : 'text-cyan-400'}
         />
         <KpiDisplay
           value={rebufferingTime.toFixed(2)}
           unit="s"
-          label="TOTAL REBUFFER TIME"
+          label="REBUFFER TIME"
           colorClass={rebufferingTime > 0 ? 'text-yellow-400' : 'text-cyan-400'}
         />
         <KpiDisplay
           value={errorCount}
-          label="PLAYBACK FAULTS"
+          label="FAULTS"
           colorClass={errorCount > 0 ? 'text-red-500 animate-pulse' : 'text-cyan-400'}
+        />
+        <KpiDisplay
+          value={formatBytes(totalBytes)}
+          label="DOWNLOADED"
         />
         <KpiDisplay
           value={playbackPercent.toFixed(1)}
           unit="%"
-          label="SIMULATION PROGRESS"
+          label="PROGRESS"
           colorClass={'text-green-400'}
         />
       </div>
 
+      {bitrateHistory.length > 0 && (
+        <div className="mb-6 p-4 bg-gray-800 border border-cyan-700/50 rounded-lg">
+          <h3 className="text-sm font-bold text-cyan-400 mb-2 uppercase">Bitrate Ladder</h3>
+          <div className="space-y-2">
+            {bitrateHistory.map((info, idx) => (
+              <div key={idx} className="flex justify-between text-xs">
+                <span className="text-gray-400">{formatBitrate(info.bitrate)}</span>
+                <span className="text-cyan-400">{info.timeSpent.toFixed(1)}s</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       <div className="relative mb-6 rounded-lg overflow-hidden shadow-2xl shadow-black/50 border-2 border-cyan-900/50 aspect-video">
-        <video
+        <ShakaPlayer
           ref={videoRef}
-          controls
-          muted
-          poster="https://placehold.co/1280x720/0f172a/67e8f9?text=SYSTEM+VIDEO+FEED"
-          className="w-full h-full object-cover"
-        ></video>
+          videoUrl={videoUrl}
+          onMetricsUpdate={handleMetricsUpdate}
+          onError={logError}
+          onPlaying={handleInitialPlay}
+          onWaiting={handleRebufferingStart}
+          onCanPlay={handleRebufferingEnd}
+        />
         {status === 'pending' && (
           <div className="absolute inset-0 flex flex-col items-center justify-center bg-black bg-opacity-90 text-cyan-400 font-mono text-xl p-4">
             <p className="p-3 border-2 border-cyan-500 rounded-lg animate-pulse tracking-widest">
@@ -366,7 +541,6 @@ const SimulationCard = React.memo(({ simulation, onUpdate, onRemove }: { simulat
         )}
       </div>
 
-      {/* Progress Bar (Cockpit Style) */}
       <div className="w-full bg-gray-700 rounded-full h-3 mt-4 overflow-hidden border border-cyan-800/50">
         <div
           className={`h-3 rounded-full transition-all duration-300 ease-out ${progressColor} shadow-lg`}
@@ -386,10 +560,10 @@ const SimulationCard = React.memo(({ simulation, onUpdate, onRemove }: { simulat
   );
 });
 
+SimulationCard.displayName = 'SimulationCard';
 
-// --- CREATION MODAL COMPONENT (Dark Theme) ---
-
-const SimulationCreator = ({ videoUrl, onCreate, setVideoUrl }: { videoUrl: string, onCreate: (sim: Simulation) => void, setVideoUrl: (url: string) => void }) => {
+// --- CREATION MODAL COMPONENT ---
+const SimulationCreator = ({ videoUrl, onCreate, setVideoUrl, clientInfo }: { videoUrl: string, onCreate: (sim: Simulation) => void, setVideoUrl: (url: string) => void, clientInfo: ClientInfo | null }) => {
   const [isOpen, setIsOpen] = useState(false);
   const [selectedPreset, setSelectedPreset] = useState('baseline');
   const [customName, setCustomName] = useState('');
@@ -411,6 +585,9 @@ const SimulationCreator = ({ videoUrl, onCreate, setVideoUrl }: { videoUrl: stri
       playbackPercent: 0,
       startTime: null,
       endTime: null,
+      totalBytes: 0,
+      bitrateHistory: [],
+      errorCodes: []
     };
     onCreate(newSim);
     setIsOpen(false);
@@ -423,20 +600,31 @@ const SimulationCreator = ({ videoUrl, onCreate, setVideoUrl }: { videoUrl: stri
         onClick={() => setIsOpen(true)}
         className="flex items-center justify-center p-3 h-14 w-full sm:w-1/2 lg:w-1/4 bg-cyan-600 hover:bg-cyan-500 text-gray-900 font-extrabold rounded-lg shadow-2xl shadow-cyan-500/50 transition duration-200 transform hover:scale-[1.01] uppercase tracking-widest border-2 border-cyan-400"
       >
-        <svg className="w-6 h-6 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6"></path></svg>
+        <svg className="w-6 h-6 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6"></path></svg>
         Activate New Simulation
       </button>
     );
   }
 
-  // Modal view
   return (
     <div className="fixed inset-0 bg-black bg-opacity-90 flex items-center justify-center z-50 p-4 font-mono">
       <div className="bg-gray-900 p-8 rounded-xl shadow-3xl w-full max-w-lg border-2 border-cyan-500/50">
         <h2 className="text-2xl font-bold text-cyan-400 mb-6 border-b border-cyan-700/50 pb-2 uppercase tracking-widest">Simulation Parameter Input</h2>
+
+        {clientInfo && (
+          <div className="mb-4 p-3 bg-gray-800 border border-cyan-700/50 rounded-lg text-xs">
+            <div className="font-bold text-cyan-400 mb-1">CLIENT INFO</div>
+            <div className="text-gray-400">
+              <div>IP: {clientInfo.ip}</div>
+              <div>Location: {clientInfo.city}, {clientInfo.region}, {clientInfo.country}</div>
+              <div>ISP: {clientInfo.org}</div>
+            </div>
+          </div>
+        )}
+
         <form onSubmit={handleCreate}>
           <div className="mb-4">
-            <label className="block text-sm font-medium text-gray-400 mb-1">Video URL (Data Source)</label>
+            <label className="block text-sm font-medium text-gray-400 mb-1">Video URL (HLS/DASH/MP4)</label>
             <input
               type="url"
               value={videoUrl}
@@ -444,7 +632,7 @@ const SimulationCreator = ({ videoUrl, onCreate, setVideoUrl }: { videoUrl: stri
               className="mt-1 block w-full bg-gray-800 border border-cyan-700/50 text-cyan-400 rounded-md shadow-inner p-3 focus:ring-cyan-500 focus:border-cyan-500"
               placeholder={PLACEHOLDER_VIDEO_URL}
             />
-            <p className="text-xs text-gray-600 mt-1">Input target media stream URI.</p>
+            <p className="text-xs text-gray-600 mt-1">Supports HLS (.m3u8), DASH (.mpd), and MP4 streams.</p>
           </div>
           <div className="mb-4">
             <label className="block text-sm font-medium text-gray-400 mb-1">Test Designation</label>
@@ -492,14 +680,28 @@ const SimulationCreator = ({ videoUrl, onCreate, setVideoUrl }: { videoUrl: stri
   );
 };
 
-
 // --- MAIN APP COMPONENT ---
-
 export default function App() {
   const [simulations, setSimulations] = useState<Simulation[]>([]);
   const [videoUrl, setVideoUrl] = useState(PLACEHOLDER_VIDEO_URL);
+  const [clientInfo, setClientInfo] = useState<ClientInfo | null>(null);
 
-  // Initial check to recommend starting with Baseline
+  useEffect(() => {
+    // Fetch client info
+    fetch('https://ipapi.co/json/')
+      .then(res => res.json())
+      .then(data => {
+        setClientInfo({
+          ip: data.ip || 'Unknown',
+          city: data.city || 'Unknown',
+          region: data.region || 'Unknown',
+          country: data.country_name || 'Unknown',
+          org: data.org || 'Unknown ISP'
+        });
+      })
+      .catch(err => console.error('Failed to fetch client info:', err));
+  }, []);
+
   useEffect(() => {
     if (simulations.length === 0) {
       setSimulations([{
@@ -509,7 +711,16 @@ export default function App() {
         preset: 'baseline',
         status: 'pending',
         isMinimized: false,
-        ttff: null, rebufferingCount: 0, rebufferingTime: 0, errorCount: 0, playbackPercent: 0, startTime: null, endTime: null,
+        ttff: null,
+        rebufferingCount: 0,
+        rebufferingTime: 0,
+        errorCount: 0,
+        playbackPercent: 0,
+        startTime: null,
+        endTime: null,
+        totalBytes: 0,
+        bitrateHistory: [],
+        errorCodes: []
       }]);
     }
   }, [simulations.length]);
@@ -542,9 +753,11 @@ export default function App() {
           <span className="text-gray-500 mr-2">[//]</span> OPERATION: MEDIA STABILITY
         </h1>
         <p className="text-gray-500 text-sm">ENGAGED: Real-time network chaos simulation. Test duration: {TEST_DURATION_SECONDS} seconds.</p>
-        <p className="mt-2 text-xs text-gray-600">
-          STATUS: Online. <span className="text-cyan-600">PINNED TESTS</span> are tracked in the Comparison Console.
-        </p>
+        {clientInfo && (
+          <p className="mt-2 text-xs text-gray-600">
+            CLIENT: {clientInfo.ip} | {clientInfo.city}, {clientInfo.country} | {clientInfo.org}
+          </p>
+        )}
       </header>
 
       <main className="max-w-7xl mx-auto">
@@ -553,10 +766,10 @@ export default function App() {
             videoUrl={videoUrl}
             setVideoUrl={setVideoUrl}
             onCreate={handleCreateSimulation}
+            clientInfo={clientInfo}
           />
         </div>
 
-        {/* Minimized View: Comparison Dashboard */}
         {minimizedSimulations.length > 0 && (
           <div className="mb-8 bg-gray-900 rounded-xl shadow-2xl shadow-cyan-900/20 border border-cyan-700/50 overflow-hidden">
             <h2 className="text-xl font-bold text-cyan-400 p-4 bg-gray-800 border-b border-cyan-700/50 uppercase tracking-wider">
@@ -575,8 +788,6 @@ export default function App() {
           </div>
         )}
 
-
-        {/* Detailed View: Active Tests */}
         <div className="space-y-6">
           {activeSimulations.length > 0 && (
             <h2 className="text-xl font-bold text-gray-400 mt-4 uppercase tracking-wider">
