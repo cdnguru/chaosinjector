@@ -71,11 +71,14 @@ const formatDuration = (ms: number | null | undefined) => {
 
 /** Formats bytes to human readable */
 const formatBytes = (bytes: number) => {
-  if (bytes === 0) return '0 B';
+  if (bytes === 0) return { value: '0', unit: 'B' };
   const k = 1024;
   const sizes = ['B', 'KB', 'MB', 'GB'];
   const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return `${(bytes / Math.pow(k, i)).toFixed(2)} ${sizes[i]}`;
+  return {
+    value: (bytes / Math.pow(k, i)).toFixed(2),
+    unit: sizes[i]
+  };
 };
 
 /** Formats bitrate to Mbps */
@@ -480,8 +483,8 @@ const SimulationCard = React.memo(({ simulation, onUpdate, onRemove }: { simulat
           <span className="text-xs text-gray-500 block">Rebuffers</span>
         </div>
         <div className="flex-1 min-w-0">
-          <span className="font-bold text-cyan-400">{formatBytes(totalBytes)}</span>
-          <span className="text-xs text-gray-500 block">Downloaded</span>
+          <span className="font-bold text-cyan-400">{formatBytes(totalBytes).value}</span>
+          <span className="text-xs text-gray-500 block">Downloaded {formatBytes(totalBytes).unit}</span>
         </div>
         <div className="flex-1 min-w-0">
           <span className={`font-bold ${errorCount > 0 ? 'text-red-500' : 'text-cyan-400'}`}>{errorCount}</span>
@@ -551,7 +554,8 @@ const SimulationCard = React.memo(({ simulation, onUpdate, onRemove }: { simulat
           colorClass={errorCount > 0 ? 'text-red-500 animate-pulse' : 'text-cyan-400'}
         />
         <KpiDisplay
-          value={formatBytes(totalBytes)}
+          value={formatBytes(totalBytes).value}
+          unit={formatBytes(totalBytes).unit}
           label="DOWNLOADED"
         />
         <KpiDisplay
