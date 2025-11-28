@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from 'recharts';
 
 // --- CONFIGURATION ---
 const DEFAULT_TEST_DURATION_SECONDS = 60;
@@ -39,6 +40,11 @@ interface BitrateInfo {
   timeSpent: number;
 }
 
+interface BitratePoint {
+  time: number;
+  bitrate: number;
+}
+
 interface ClientInfo {
   ip: string;
   city: string;
@@ -68,6 +74,7 @@ interface Simulation {
   cacheBuster: string;
   droppedFrames: number;
   bufferGap: number;
+  bitrateTimeline: BitratePoint[];
 }
 
 // --- UTILITY FUNCTIONS & STYLED COMPONENTS ---
@@ -127,7 +134,7 @@ const ShakaPlayer = React.forwardRef<HTMLVideoElement, {
   videoUrl: string;
   status: Simulation['status'];
   networkConfig?: PresetConfig['network'];
-  onMetricsUpdate: (metrics: { totalBytes: number; currentBitrate: number; droppedFrames: number; bufferGap: number }) => void;
+  onMetricsUpdate: (metrics: { totalBytes: number; currentBitrate: number; droppedFrames: number; bufferGap: number; time: number }) => void;
   onError: (code: number, message: string) => void;
   onPlaying: () => void;
   onWaiting: () => void;
@@ -189,7 +196,8 @@ const ShakaPlayer = React.forwardRef<HTMLVideoElement, {
               totalBytes: Math.round(downloadedBytes),
               currentBitrate: 5000000, // 5 Mbps estimate
               droppedFrames: 0,
-              bufferGap: 0
+              bufferGap: 0,
+              time: videoElement.current.currentTime
             });
           }
         }
@@ -301,7 +309,8 @@ const ShakaPlayer = React.forwardRef<HTMLVideoElement, {
               totalBytes: Math.round(totalBytes),
               currentBitrate: Math.round(currentBitrate),
               droppedFrames: droppedFrames,
-              bufferGap: parseFloat(currentBufferGap.toFixed(2))
+              bufferGap: parseFloat(currentBufferGap.toFixed(2)),
+              time: player.getStats().playTime || 0
             });
           }
         }, 1000);
@@ -351,7 +360,7 @@ const SimulationCard = React.memo(({ simulation, onUpdate, onRemove }: { simulat
   const lastBitrateRef = useRef<number>(0);
   const bitrateStartTimeRef = useRef<number>(0);
 
-  const { id, name, preset, status, isMinimized, errorCount, rebufferingCount, rebufferingTime, ttff, playbackPercent, startTime, videoUrl, totalBytes, bitrateHistory, errorCodes, testDuration, cacheBuster, droppedFrames, bufferGap } = simulation;
+  const { id, name, preset, status, isMinimized, errorCount, rebufferingCount, rebufferingTime, ttff, playbackPercent, startTime, videoUrl, totalBytes, bitrateHistory, errorCodes, testDuration, cacheBuster, droppedFrames, bufferGap, bitrateTimeline } = simulation;
   const config = PRESETS[preset];
 
   // Add cache-busting parameter to video URL
@@ -414,7 +423,7 @@ const SimulationCard = React.memo(({ simulation, onUpdate, onRemove }: { simulat
     handleRebufferingEnd();
   }, [id, onUpdate, updateStatus, handleRebufferingEnd]);
 
-  const handleMetricsUpdate = useCallback((metrics: { totalBytes: number; currentBitrate: number }) => {
+  const handleMetricsUpdate = useCallback((metrics: { totalBytes: number; currentBitrate: number; droppedFrames: number; bufferGap: number; time: number }) => {
     onUpdate(id, (sim: Simulation) => {
       const newHistory = [...sim.bitrateHistory];
 
@@ -429,9 +438,21 @@ const SimulationCard = React.memo(({ simulation, onUpdate, onRemove }: { simulat
 
       lastBitrateRef.current = metrics.currentBitrate;
 
+      // Update bitrate timeline
+      let newTimeline = sim.bitrateTimeline;
+      if (metrics.time > 0) {
+        // Only add point if it's new or significantly different time
+        const lastPoint = newTimeline[newTimeline.length - 1];
+        if (!lastPoint || (metrics.time - lastPoint.time > 1) || (lastPoint.bitrate !== metrics.currentBitrate)) {
+          newTimeline = [...newTimeline, { time: metrics.time, bitrate: metrics.currentBitrate }];
+        }
+      }
+
       return {
         totalBytes: metrics.totalBytes,
-        bitrateHistory: newHistory
+        droppedFrames: metrics.droppedFrames,
+        bufferGap: metrics.bufferGap,
+        bitrateTimeline: newTimeline
       };
     });
   }, [id, onUpdate]);
@@ -608,6 +629,51 @@ const SimulationCard = React.memo(({ simulation, onUpdate, onRemove }: { simulat
     </div>
   );
 
+  const BitrateChart = ({ data }: { data: BitratePoint[] }) => {
+    if (data.length === 0) return <div className="h-full flex items-center justify-center text-gray-500 text-xs">NO DATA</div>;
+
+    // Format data for chart - convert bps to Mbps
+    const chartData = data.map(d => ({
+      time: d.time,
+      bitrate: parseFloat((d.bitrate / 1000000).toFixed(2))
+    }));
+
+    return (
+      <ResponsiveContainer width="100%" height="100%">
+        <LineChart data={chartData}>
+          <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
+          <XAxis
+            dataKey="time"
+            type="number"
+            domain={['dataMin', 'dataMax']}
+            tick={{ fill: '#94a3b8', fontSize: 10 }}
+            tickFormatter={(val) => val.toFixed(0) + 's'}
+          />
+          <YAxis
+            tick={{ fill: '#94a3b8', fontSize: 10 }}
+            tickFormatter={(val) => val + 'M'}
+            domain={[0, 'auto']}
+          />
+          <Tooltip
+            contentStyle={{ backgroundColor: '#0f172a', borderColor: '#0891b2', fontSize: '12px' }}
+            itemStyle={{ color: '#22d3ee' }}
+            formatter={(value: number) => [`${value} Mbps`, 'Bitrate']}
+            labelFormatter={(label: number) => `Time: ${label.toFixed(1)}s`}
+          />
+          <Line
+            type="stepAfter"
+            dataKey="bitrate"
+            stroke="#22d3ee"
+            strokeWidth={2}
+            dot={false}
+            activeDot={{ r: 4, fill: '#22d3ee' }}
+            isAnimationActive={false}
+          />
+        </LineChart>
+      </ResponsiveContainer>
+    );
+  };
+
   const renderDetailed = () => (
     <div className="w-full mb-6 bg-gray-900 rounded-xl shadow-2xl shadow-cyan-900/20 border border-cyan-800/50 p-6 font-mono text-gray-200">
       <div className="flex justify-between items-start border-b border-cyan-700/50 pb-4 mb-4">
@@ -702,6 +768,15 @@ const SimulationCard = React.memo(({ simulation, onUpdate, onRemove }: { simulat
         </div>
       )}
 
+      {bitrateTimeline.length > 0 && (
+        <div className="mt-6 p-4 bg-gray-800 rounded-lg border border-cyan-900/30">
+          <h3 className="text-xs font-bold text-gray-400 uppercase tracking-widest mb-3">Bitrate Timeline</h3>
+          <div className="h-40 w-full">
+            <BitrateChart data={bitrateTimeline} />
+          </div>
+        </div>
+      )}
+
       <div className="relative mb-6 rounded-lg overflow-hidden shadow-2xl shadow-black/50 border-2 border-cyan-900/50 aspect-video">
         <ShakaPlayer
           ref={videoRef}
@@ -775,7 +850,8 @@ const SimulationCreator = ({ videoUrl, onCreate, setVideoUrl, clientInfo }: { vi
       testDuration: testDuration,
       cacheBuster: Date.now().toString(),
       droppedFrames: 0,
-      bufferGap: 0
+      bufferGap: 0,
+      bitrateTimeline: []
     };
     onCreate(newSim);
     setIsOpen(false);
@@ -924,7 +1000,8 @@ export default function App() {
         testDuration: DEFAULT_TEST_DURATION_SECONDS,
         cacheBuster: Date.now().toString(),
         droppedFrames: 0,
-        bufferGap: 0
+        bufferGap: 0,
+        bitrateTimeline: []
       }]);
     }
   }, [simulations.length]);
