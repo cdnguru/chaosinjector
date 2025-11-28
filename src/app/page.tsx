@@ -288,7 +288,7 @@ const ShakaPlayer = React.forwardRef<HTMLVideoElement, {
         metricsIntervalRef.current = setInterval(() => {
           if (player) {
             const stats = player.getStats();
-            const currentBitrate = stats.estimatedBandwidth || 0;
+            const currentBitrate = stats.streamBandwidth || 0;
             const totalBytes = stats.streamBandwidth ? (stats.streamBandwidth * stats.playTime) / 8 : 0;
             const droppedFrames = stats.droppedFrames || 0;
             const bufferGap = stats.bufferingTime || 0; // This is total buffering time, not current gap.
@@ -754,19 +754,7 @@ const SimulationCard = React.memo(({ simulation, onUpdate, onRemove }: { simulat
         />
       </div>
 
-      {bitrateHistory.length > 0 && (
-        <div className="mb-6 p-4 bg-gray-800 border border-cyan-700/50 rounded-lg">
-          <h3 className="text-sm font-bold text-cyan-400 mb-2 uppercase">Bitrate Ladder</h3>
-          <div className="space-y-2">
-            {bitrateHistory.map((info, idx) => (
-              <div key={idx} className="flex justify-between text-xs">
-                <span className="text-gray-400">{formatBitrate(info.bitrate)}</span>
-                <span className="text-cyan-400">{info.timeSpent.toFixed(1)}s</span>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
+
 
       {bitrateTimeline.length > 0 && (
         <div className="mt-6 p-4 bg-gray-800 rounded-lg border border-cyan-900/30">
