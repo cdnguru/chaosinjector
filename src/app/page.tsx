@@ -15,11 +15,21 @@ interface PresetConfig {
   delay: number;
   errorRate: number;
   chaosType: ChaosType;
+  network?: {
+    latency?: number;
+    jitter?: [number, number];
+    throttleBps?: number;
+  };
 }
 
 const PRESETS: Record<string, PresetConfig> = {
   baseline: { name: "BASELINE (STABLE)", description: "Standard load with no injected errors. System check complete.", delay: 0, errorRate: 0.0, chaosType: 'none' },
-  latency: { name: "LATENCY INJECT", description: "Simulates 1 second initial network delay. High-stress pre-buffer test.", delay: 1000, errorRate: 0.0, chaosType: 'none' },
+  latency: { name: "LATENCY INJECT (1s)", description: "Simulates 1 second initial network delay. High-stress pre-buffer test.", delay: 1000, errorRate: 0.0, chaosType: 'none' },
+  'high-latency': { name: "HIGH LATENCY (800ms)", description: "Consistent 800ms network latency on all requests.", delay: 0, errorRate: 0.0, chaosType: 'none', network: { latency: 800 } },
+  'bouncy-latency': { name: "BOUNCY LATENCY", description: "Random latency between 150ms and 1500ms (Jitter).", delay: 0, errorRate: 0.0, chaosType: 'none', network: { jitter: [150, 1500] } },
+  'throttle-1mbps': { name: "THROTTLE 1 Mbps", description: "Bandwidth limited to 1 Mbps. Forces quality drop.", delay: 0, errorRate: 0.0, chaosType: 'none', network: { throttleBps: 1000000 } },
+  'throttle-3mbps': { name: "THROTTLE 3 Mbps", description: "Bandwidth limited to 3 Mbps. Mid-range constraint.", delay: 0, errorRate: 0.0, chaosType: 'none', network: { throttleBps: 3000000 } },
+  'throttle-5mbps': { name: "THROTTLE 5 Mbps", description: "Bandwidth limited to 5 Mbps. High-range constraint.", delay: 0, errorRate: 0.0, chaosType: 'none', network: { throttleBps: 5000000 } },
   '404': { name: "NETWORK ERROR (10%)", description: "10% chance of a segment fault during transmission.", delay: 0, errorRate: 0.1, chaosType: '404' },
   spikey: { name: "SPIKE CHAOS", description: "Randomly injects packet drops and buffering events. High variability.", delay: 0, errorRate: 0.05, chaosType: 'spikey' }
 };
@@ -56,6 +66,8 @@ interface Simulation {
   errorCodes: number[];
   testDuration: number;
   cacheBuster: string;
+  droppedFrames: number;
+  bufferGap: number;
 }
 
 // --- UTILITY FUNCTIONS & STYLED COMPONENTS ---
@@ -114,12 +126,13 @@ const KpiDisplay = ({ value, label, unit = '', colorClass = 'text-cyan-400' }: {
 const ShakaPlayer = React.forwardRef<HTMLVideoElement, {
   videoUrl: string;
   status: Simulation['status'];
-  onMetricsUpdate: (metrics: { totalBytes: number; currentBitrate: number }) => void;
+  networkConfig?: PresetConfig['network'];
+  onMetricsUpdate: (metrics: { totalBytes: number; currentBitrate: number; droppedFrames: number; bufferGap: number }) => void;
   onError: (code: number, message: string) => void;
   onPlaying: () => void;
   onWaiting: () => void;
   onCanPlay: () => void;
-}>(({ videoUrl, status, onMetricsUpdate, onError, onPlaying, onWaiting, onCanPlay }, ref) => {
+}>(({ videoUrl, status, networkConfig, onMetricsUpdate, onError, onPlaying, onWaiting, onCanPlay }, ref) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const playerRef = useRef<any>(null);
   const metricsIntervalRef = useRef<NodeJS.Timeout | null>(null);
@@ -174,7 +187,9 @@ const ShakaPlayer = React.forwardRef<HTMLVideoElement, {
 
             onMetricsUpdate({
               totalBytes: Math.round(downloadedBytes),
-              currentBitrate: 5000000 // 5 Mbps estimate
+              currentBitrate: 5000000, // 5 Mbps estimate
+              droppedFrames: 0,
+              bufferGap: 0
             });
           }
         }
@@ -207,6 +222,40 @@ const ShakaPlayer = React.forwardRef<HTMLVideoElement, {
         const player = new shaka.Player();
         playerRef.current = player;
 
+        // Configure network filters for chaos injection
+        if (networkConfig) {
+          const networkingEngine = player.getNetworkingEngine();
+
+          // Request Filter: Latency & Jitter
+          if (networkConfig.latency || networkConfig.jitter) {
+            networkingEngine.registerRequestFilter((type: any, request: any) => {
+              return new Promise<void>((resolve) => {
+                let delay = networkConfig.latency || 0;
+                if (networkConfig.jitter) {
+                  const [min, max] = networkConfig.jitter;
+                  delay += Math.random() * (max - min) + min;
+                }
+                setTimeout(resolve, delay);
+              });
+            });
+          }
+
+          // Response Filter: Bandwidth Throttling
+          if (networkConfig.throttleBps) {
+            networkingEngine.registerResponseFilter((type: any, response: any) => {
+              return new Promise<void>((resolve) => {
+                const bytes = response.data.byteLength;
+                const bits = bytes * 8;
+                // Calculate time needed to transfer these bits at the throttled rate
+                // Subtract the time it actually took (approximated as 0 for simulation or could use response.timeMs if available)
+                // For simulation, we just add the full delay needed for the transfer
+                const delayMs = (bits / networkConfig.throttleBps!) * 1000;
+                setTimeout(resolve, delayMs);
+              });
+            });
+          }
+        }
+
         player.attach(videoElement.current);
 
         // Error handling
@@ -233,10 +282,26 @@ const ShakaPlayer = React.forwardRef<HTMLVideoElement, {
             const stats = player.getStats();
             const currentBitrate = stats.estimatedBandwidth || 0;
             const totalBytes = stats.streamBandwidth ? (stats.streamBandwidth * stats.playTime) / 8 : 0;
+            const droppedFrames = stats.droppedFrames || 0;
+            const bufferGap = stats.bufferingTime || 0; // This is total buffering time, not current gap.
+            // Better buffer gap calculation:
+            let currentBufferGap = 0;
+            if (videoElement.current) {
+              const buffered = videoElement.current.buffered;
+              const currentTime = videoElement.current.currentTime;
+              for (let i = 0; i < buffered.length; i++) {
+                if (buffered.start(i) <= currentTime && buffered.end(i) >= currentTime) {
+                  currentBufferGap = buffered.end(i) - currentTime;
+                  break;
+                }
+              }
+            }
 
             onMetricsUpdate({
               totalBytes: Math.round(totalBytes),
-              currentBitrate: Math.round(currentBitrate)
+              currentBitrate: Math.round(currentBitrate),
+              droppedFrames: droppedFrames,
+              bufferGap: parseFloat(currentBufferGap.toFixed(2))
             });
           }
         }, 1000);
@@ -286,7 +351,7 @@ const SimulationCard = React.memo(({ simulation, onUpdate, onRemove }: { simulat
   const lastBitrateRef = useRef<number>(0);
   const bitrateStartTimeRef = useRef<number>(0);
 
-  const { id, name, preset, status, isMinimized, errorCount, rebufferingCount, rebufferingTime, ttff, playbackPercent, startTime, videoUrl, totalBytes, bitrateHistory, errorCodes, testDuration, cacheBuster } = simulation;
+  const { id, name, preset, status, isMinimized, errorCount, rebufferingCount, rebufferingTime, ttff, playbackPercent, startTime, videoUrl, totalBytes, bitrateHistory, errorCodes, testDuration, cacheBuster, droppedFrames, bufferGap } = simulation;
   const config = PRESETS[preset];
 
   // Add cache-busting parameter to video URL
@@ -524,10 +589,20 @@ const SimulationCard = React.memo(({ simulation, onUpdate, onRemove }: { simulat
         </div>
         <div className="flex-1 min-w-0">
           <span className={`font-bold ${errorCount > 0 ? 'text-red-500' : 'text-cyan-400'}`}>{errorCount}</span>
-          <span className="text-xs text-gray-500 block">Faults</span>
+          <span className="text-xs text-gray-500 block">Errors</span>
         </div>
         <div className="flex-1 min-w-0">
           <span className={`font-bold text-lg ${errorCount > 0 ? 'text-red-500' : 'text-green-400'}`}>{playbackPercent.toFixed(1)}%</span>
+        </div>
+      </div>
+      <div className="flex flex-1 justify-between text-center text-xs ml-4 mt-2 border-t border-cyan-900/30 pt-2">
+        <div className="flex-1 min-w-0">
+          <span className="font-bold text-cyan-400">{droppedFrames}</span>
+          <span className="text-xs text-gray-500 block">Dropped</span>
+        </div>
+        <div className="flex-1 min-w-0">
+          <span className="font-bold text-cyan-400">{bufferGap.toFixed(1)}s</span>
+          <span className="text-xs text-gray-500 block">Buffer</span>
         </div>
       </div>
     </div>
@@ -595,6 +670,17 @@ const SimulationCard = React.memo(({ simulation, onUpdate, onRemove }: { simulat
           label="DOWNLOADED"
         />
         <KpiDisplay
+          value={droppedFrames}
+          label="DROPPED FRAMES"
+          colorClass={droppedFrames > 0 ? 'text-yellow-400' : 'text-cyan-400'}
+        />
+        <KpiDisplay
+          value={bufferGap.toFixed(2)}
+          unit="s"
+          label="BUFFER HEALTH"
+          colorClass={bufferGap < 2 ? 'text-red-400' : 'text-cyan-400'}
+        />
+        <KpiDisplay
           value={playbackPercent.toFixed(1)}
           unit="%"
           label="PROGRESS"
@@ -621,6 +707,7 @@ const SimulationCard = React.memo(({ simulation, onUpdate, onRemove }: { simulat
           ref={videoRef}
           videoUrl={videoUrlWithCache}
           status={status}
+          networkConfig={config.network}
           onMetricsUpdate={handleMetricsUpdate}
           onError={logError}
           onPlaying={handleInitialPlay}
@@ -686,7 +773,9 @@ const SimulationCreator = ({ videoUrl, onCreate, setVideoUrl, clientInfo }: { vi
       bitrateHistory: [],
       errorCodes: [],
       testDuration: testDuration,
-      cacheBuster: Date.now().toString()
+      cacheBuster: Date.now().toString(),
+      droppedFrames: 0,
+      bufferGap: 0
     };
     onCreate(newSim);
     setIsOpen(false);
@@ -833,7 +922,9 @@ export default function App() {
         bitrateHistory: [],
         errorCodes: [],
         testDuration: DEFAULT_TEST_DURATION_SECONDS,
-        cacheBuster: Date.now().toString()
+        cacheBuster: Date.now().toString(),
+        droppedFrames: 0,
+        bufferGap: 0
       }]);
     }
   }, [simulations.length]);
